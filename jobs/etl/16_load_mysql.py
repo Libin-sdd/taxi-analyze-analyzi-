@@ -16,6 +16,32 @@ from getpass import getpass
 
 
 # ============================================================
+# 各表主键（增量 upsert 的依据）
+#
+# 有了主键之后，写入方式从"先 TRUNCATE 再 INSERT"改成
+# "INSERT ... ON DUPLICATE KEY UPDATE"：
+#   - 主键不存在 -> 插入新行（增量新增）
+#   - 主键已存在 -> 更新整行（增量更新）
+# 这样下游 MySQL 表永远是最新的，且不会产生重复数据。
+#
+# 注意：ads_overall_metrics 是单行整体指标，没有业务主键，
+# 继续使用覆盖写（TRUNCATE + INSERT）。
+# ============================================================
+
+PRIMARY_KEYS = {
+    "dws_daily_taxi": ["trip_date"],
+    "dws_hourly_taxi": ["pickup_hour"],
+    "dws_location_taxi": ["PULocationID"],
+    "dws_location_zone": ["PULocationID"],
+    "location_trip_top10": ["PULocationID"],
+    "ads_location_revenue_top10": ["PULocationID"],
+    "ads_location_avg_revenue_top10": ["PULocationID"],
+    "ads_borough_location_top3": ["PULocationID"],
+    "ads_location_data_quality": ["PULocationID"],
+}
+
+
+# ============================================================
 # Spark
 # ============================================================
 
@@ -84,7 +110,8 @@ def print_title(title):
 def create_mysql_table(
         cursor,
         table_name,
-        spark_df
+        spark_df,
+        primary_key=None
 ):
 
     fields = []
@@ -100,6 +127,15 @@ def create_mysql_table(
             f"`{column_name}` {mysql_type}"
         )
 
+    # 有主键时，在建表语句里带上 PRIMARY KEY
+    if primary_key:
+        key_sql = ", ".join(
+            f"`{key}`" for key in primary_key
+        )
+        fields.append(
+            f"PRIMARY KEY ({key_sql})"
+        )
+
     create_sql = f"""
     CREATE TABLE IF NOT EXISTS `{table_name}` (
         {", ".join(fields)}
@@ -109,6 +145,40 @@ def create_mysql_table(
     """
 
     cursor.execute(create_sql)
+
+
+# ============================================================
+# 给已有表补充主键
+#
+# 旧版本建的表没有主键，导致无法 upsert。
+# 这里尝试 ALTER TABLE 补上；如果主键已存在会报错，忽略即可。
+# ============================================================
+
+def ensure_primary_key(
+        cursor,
+        table_name,
+        primary_key
+):
+
+    if not primary_key:
+        return
+
+    key_sql = ", ".join(
+        f"`{key}`" for key in primary_key
+    )
+
+    try:
+        cursor.execute(
+            f"ALTER TABLE `{table_name}` "
+            f"ADD PRIMARY KEY ({key_sql})"
+        )
+        print(
+            f"  已为 {table_name} 补充主键：{key_sql}"
+        )
+
+    except Exception as e:
+        # 主键已存在等情况，忽略
+        pass
 
 
 # ============================================================
@@ -182,30 +252,30 @@ def load_dataframe_to_mysql(
     cursor = connection.cursor()
 
     # --------------------------------------------------------
-    # 创建表
+    # 主键（upsert 增量写入的依据）
     # --------------------------------------------------------
+
+    primary_key = PRIMARY_KEYS.get(table_name)
 
     create_mysql_table(
         cursor,
         table_name,
-        spark_df
+        spark_df,
+        primary_key
     )
 
+    if primary_key:
+        ensure_primary_key(
+            cursor,
+            table_name,
+            primary_key
+        )
+
     # --------------------------------------------------------
-    # 清空旧数据
+    # 写入 SQL
     #
-    # 非常重要：
-    # 这里采用覆盖，而不是 append
-    # 防止脚本重复运行产生重复数据
-    # --------------------------------------------------------
-
-    truncate_table(
-        cursor,
-        table_name
-    )
-
-    # --------------------------------------------------------
-    # SQL
+    # 有主键 -> INSERT ... ON DUPLICATE KEY UPDATE（upsert 增量）
+    # 无主键 -> TRUNCATE + INSERT（整体覆盖，例如单行指标表）
     # --------------------------------------------------------
 
     columns = list(
@@ -221,12 +291,46 @@ def load_dataframe_to_mysql(
         ["%s"] * len(columns)
     )
 
-    insert_sql = f"""
-    INSERT INTO `{table_name}`
-    ({column_sql})
-    VALUES
-    ({placeholder_sql})
-    """
+    if primary_key:
+
+        # 主键之外的字段，冲突时全部更新
+        update_columns = [
+            column for column in columns
+            if column not in primary_key
+        ]
+
+        update_sql = ", ".join(
+            f"`{column}` = VALUES(`{column}`)"
+            for column in update_columns
+        )
+
+        write_sql = f"""
+        INSERT INTO `{table_name}`
+        ({column_sql})
+        VALUES
+        ({placeholder_sql})
+        ON DUPLICATE KEY UPDATE
+        {update_sql}
+        """
+
+        print("写入方式：增量 upsert（按主键）")
+
+    else:
+
+        # 没有主键的表（例如单行整体指标），整体覆盖
+        truncate_table(
+            cursor,
+            table_name
+        )
+
+        write_sql = f"""
+        INSERT INTO `{table_name}`
+        ({column_sql})
+        VALUES
+        ({placeholder_sql})
+        """
+
+        print("写入方式：覆盖写（TRUNCATE + INSERT）")
 
     # --------------------------------------------------------
     # 数据转换
@@ -270,7 +374,7 @@ def load_dataframe_to_mysql(
     # --------------------------------------------------------
 
     cursor.executemany(
-        insert_sql,
+        write_sql,
         rows
     )
 
