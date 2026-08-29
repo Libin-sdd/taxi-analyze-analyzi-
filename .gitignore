@@ -1,0 +1,12 @@
+# 敏感配置（含 API Key/数据库密码，绝不能提交）
+config/config.yaml
+
+# 缓存与生成物
+__pycache__/
+*.pyc
+.mplcache/
+data/
+warehouse/
+# IDE
+.idea/
+.vscode/
